@@ -1,0 +1,26 @@
+name: keepalive
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # mandag 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: update heartbeat
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+
+      - name: commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -m "chore: heartbeat" || exit 0
+          git push
