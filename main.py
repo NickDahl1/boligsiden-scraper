@@ -88,7 +88,9 @@ def calculate_daily_stats(df: pd.DataFrame) -> pd.DataFrame:
         "Dato": str(today),  # matcher din tabel: text
         "Total_Antal_Boliger": int(len(df)),
         "Total_Gns_Pris_kr": float(df["salgspris_kr"].mean()) if "salgspris_kr" in df.columns else None,
-        "Total_Median_Pris_kr": float(df["salgspris_kr"].median()) if "salgspris_kr" in df.columns else None,
+        "Total_Median_Pris_kr": int(round(df["salgspris_kr"].median()))
+            if "salgspris_kr" in df.columns and pd.notna(df["salgspris_kr"].median())
+            else None,
         "Total_Gns_M2_Pris_kr": float(df["pris_per_m2_kr"].mean()) if "pris_per_m2_kr" in df.columns else None,
         "Total_Gns_Liggetid_dage": float(df["dage_paa_marked_nu"].mean()) if "dage_paa_marked_nu" in df.columns else None,
         "Total_Samlet_Udbud_mia_kr": float(df["salgspris_kr"].sum() / 1_000_000_000)
