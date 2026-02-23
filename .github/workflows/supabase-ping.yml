@@ -1,43 +1,344 @@
-name: supabase ping + mini report
+name: supabase ping + extended report
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # hver 6. time (UTC)
+    - cron: "0 */6 * * *" # hver 6. time (UTC)
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: ping supabase + create report
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: fetch supabase data + generate report
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euo pipefail
 
-          # 1) Ping (lille SELECT). Hvis denne fejler, fejler workflowet også.
-          echo "Pinging Supabase REST..."
+          echo "Fetching last rows from Supabase REST..."
           curl -sS -f \
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/daily_stats?select=Dato,Total_Antal_Boliger,Total_Gns_Pris_kr&order=Dato.desc&limit=1" \
-            -o latest.json
+            "${SUPABASE_URL}/rest/v1/daily_stats?select=Dato,Total_Antal_Boliger,Total_Gns_Pris_kr,Total_Median_Pris_kr,Total_Gns_M2_Pris_kr,Total_Gns_Liggetid_dage,Total_Samlet_Udbud_mia_kr&order=Dato.desc&limit=21" \
+            -o data.json
 
-          # 2) Mini-analyse tilbage til GitHub (Actions Job Summary)
-          echo "## Supabase ping report ✅" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- time (utc): $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_STEP_SUMMARY"
-          echo "- supabase url: ${SUPABASE_URL}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### latest row from daily_stats" >> "$GITHUB_STEP_SUMMARY"
-          echo '```json' >> "$GITHUB_STEP_SUMMARY"
-          cat latest.json >> "$GITHUB_STEP_SUMMARY"
-          echo '' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import json, os, math, statistics
+          from datetime import datetime
 
-      - name: upload report artifact
+          def to_float(x):
+              if x is None:
+                  return None
+              try:
+                  return float(x)
+              except Exception:
+                  return None
+
+          def to_int(x):
+              if x is None:
+                  return None
+              try:
+                  return int(float(x))
+              except Exception:
+                  return None
+
+          def fmt_num(x, digits=0):
+              if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+                  return "—"
+              if digits == 0:
+                  return f"{x:,.0f}".replace(",", ".")
+              return f"{x:,.{digits}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+          def fmt_pct(x, digits=1):
+              if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+                  return "—"
+              return f"{x:.{digits}f}%".replace(".", ",")
+
+          def safe_pct_change(new, old):
+              if new is None or old is None:
+                  return None
+              if old == 0:
+                  return None
+              return (new - old) / old * 100.0
+
+          def safe_diff(new, old):
+              if new is None or old is None:
+                  return None
+              return new - old
+
+          def rolling_avg(vals):
+              vals = [v for v in vals if v is not None]
+              return sum(vals) / len(vals) if vals else None
+
+          def stdev(vals):
+              vals = [v for v in vals if v is not None]
+              if len(vals) < 2:
+                  return None
+              return statistics.stdev(vals)
+
+          def slope_per_day(vals):
+              # simpel lineær trend: hældning på y over x=0..n-1 (ældre -> nyere)
+              ys = [v for v in vals if v is not None]
+              # vi kræver samme længde som input for korrekt trend; ellers drop
+              if any(v is None for v in vals):
+                  return None
+              n = len(vals)
+              if n < 2:
+                  return None
+              xs = list(range(n))
+              xbar = sum(xs) / n
+              ybar = sum(vals) / n
+              num = sum((x - xbar) * (y - ybar) for x, y in zip(xs, vals))
+              den = sum((x - xbar) ** 2 for x in xs)
+              return num / den if den else None
+
+          with open("data.json", "r", encoding="utf-8") as f:
+              rows = json.load(f)
+
+          # rows kommer desc (nyeste først). Vi vender så vi har ældste -> nyeste.
+          rows = list(reversed(rows))
+
+          if not rows:
+              raise SystemExit("no rows returned from supabase")
+
+          # parse datoer og værdier
+          dates = [r.get("Dato") for r in rows]
+          def col(name, caster):
+              return [caster(r.get(name)) for r in rows]
+
+          antal = col("Total_Antal_Boliger", to_int)
+          gns_pris = col("Total_Gns_Pris_kr", to_float)
+          median_pris = col("Total_Median_Pris_kr", to_int)
+          m2_pris = col("Total_Gns_M2_Pris_kr", to_float)
+          liggetid = col("Total_Gns_Liggetid_dage", to_float)
+          udbud_mia = col("Total_Samlet_Udbud_mia_kr", to_float)
+
+          latest_i = len(rows) - 1
+          prev_i = latest_i - 1 if latest_i - 1 >= 0 else None
+          i_7 = latest_i - 7 if latest_i - 7 >= 0 else None
+          i_14 = latest_i - 14 if latest_i - 14 >= 0 else None
+
+          def pick(vals, i):
+              return vals[i] if i is not None else None
+
+          latest = {
+              "Dato": dates[latest_i],
+              "Total_Antal_Boliger": pick(antal, latest_i),
+              "Total_Gns_Pris_kr": pick(gns_pris, latest_i),
+              "Total_Median_Pris_kr": pick(median_pris, latest_i),
+              "Total_Gns_M2_Pris_kr": pick(m2_pris, latest_i),
+              "Total_Gns_Liggetid_dage": pick(liggetid, latest_i),
+              "Total_Samlet_Udbud_mia_kr": pick(udbud_mia, latest_i),
+          }
+
+          prev = {k: pick(v, prev_i) for k, v in {
+              "Total_Antal_Boliger": antal,
+              "Total_Gns_Pris_kr": gns_pris,
+              "Total_Median_Pris_kr": median_pris,
+              "Total_Gns_M2_Pris_kr": m2_pris,
+              "Total_Gns_Liggetid_dage": liggetid,
+              "Total_Samlet_Udbud_mia_kr": udbud_mia,
+          }.items()} if prev_i is not None else None
+
+          w7 = {k: pick(v, i_7) for k, v in {
+              "Total_Antal_Boliger": antal,
+              "Total_Gns_Pris_kr": gns_pris,
+              "Total_Median_Pris_kr": median_pris,
+              "Total_Gns_M2_Pris_kr": m2_pris,
+              "Total_Gns_Liggetid_dage": liggetid,
+              "Total_Samlet_Udbud_mia_kr": udbud_mia,
+          }.items()} if i_7 is not None else None
+
+          w14 = {k: pick(v, i_14) for k, v in {
+              "Total_Antal_Boliger": antal,
+              "Total_Gns_Pris_kr": gns_pris,
+              "Total_Median_Pris_kr": median_pris,
+              "Total_Gns_M2_Pris_kr": m2_pris,
+              "Total_Gns_Liggetid_dage": liggetid,
+              "Total_Samlet_Udbud_mia_kr": udbud_mia,
+          }.items()} if i_14 is not None else None
+
+          # 7d vindue = seneste 7 dage inkl. i dag (op til 7 observationer)
+          last7_slice = slice(max(0, latest_i - 6), latest_i + 1)
+          last14_slice = slice(max(0, latest_i - 13), latest_i + 1)
+
+          def window(vals, sl):
+              return vals[sl]
+
+          stats = {}
+          for label, vals in [
+              ("Total_Antal_Boliger", antal),
+              ("Total_Gns_Pris_kr", gns_pris),
+              ("Total_Median_Pris_kr", median_pris),
+              ("Total_Gns_M2_Pris_kr", m2_pris),
+              ("Total_Gns_Liggetid_dage", liggetid),
+              ("Total_Samlet_Udbud_mia_kr", udbud_mia),
+          ]:
+              v7 = window(vals, last7_slice)
+              v14 = window(vals, last14_slice)
+              stats[label] = {
+                  "avg_7d": rolling_avg(v7),
+                  "min_7d": min([v for v in v7 if v is not None], default=None),
+                  "max_7d": max([v for v in v7 if v is not None], default=None),
+                  "std_7d": stdev(v7),
+                  "trend_slope_7d": slope_per_day(v7) if all(v is not None for v in v7) else None,
+                  "avg_14d": rolling_avg(v14),
+                  "std_14d": stdev(v14),
+              }
+
+          def md_line(name, latest_v, prev_v, w7_v, w14_v, digits, unit=""):
+              d1 = safe_diff(latest_v, prev_v)
+              p1 = safe_pct_change(latest_v, prev_v)
+
+              d7 = safe_diff(latest_v, w7_v)
+              p7 = safe_pct_change(latest_v, w7_v)
+
+              d14 = safe_diff(latest_v, w14_v)
+              p14 = safe_pct_change(latest_v, w14_v)
+
+              def fmt_delta(d, digits):
+                  if d is None:
+                      return "—"
+                  sign = "+" if d > 0 else ""
+                  return f"{sign}{fmt_num(d, digits)}{unit}"
+
+              def fmt_val(v, digits):
+                  if v is None:
+                      return "—"
+                  return f"{fmt_num(v, digits)}{unit}"
+
+              return (
+                  f"| {name} | {fmt_val(latest_v, digits)} | "
+                  f"{fmt_delta(d1, digits)} ({fmt_pct(p1)}) | "
+                  f"{fmt_delta(d7, digits)} ({fmt_pct(p7)}) | "
+                  f"{fmt_delta(d14, digits)} ({fmt_pct(p14)}) |"
+              )
+
+          now_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+          supabase_url = os.environ.get("SUPABASE_URL", "")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not summary_path:
+              raise SystemExit("GITHUB_STEP_SUMMARY not set")
+
+          # bygg markdown
+          lines = []
+          lines.append("## Supabase extended ping report ✅")
+          lines.append("")
+          lines.append(f"- time (utc): {now_utc}")
+          lines.append(f"- supabase url: {supabase_url}")
+          lines.append(f"- rows fetched: {len(rows)} (oldest: {dates[0]}, latest: {dates[-1]})")
+          lines.append("")
+
+          lines.append("### Latest snapshot")
+          lines.append("")
+          lines.append("| metric | value |")
+          lines.append("|---|---:|")
+          lines.append(f'| date | {latest["Dato"]} |')
+          lines.append(f'| total listings | {fmt_num(latest["Total_Antal_Boliger"], 0)} |')
+          lines.append(f'| avg price (kr) | {fmt_num(latest["Total_Gns_Pris_kr"], 0)} |')
+          lines.append(f'| median price (kr) | {fmt_num(latest["Total_Median_Pris_kr"], 0)} |')
+          lines.append(f'| avg m² price (kr/m²) | {fmt_num(latest["Total_Gns_M2_Pris_kr"], 0)} |')
+          lines.append(f'| avg time on market (days) | {fmt_num(latest["Total_Gns_Liggetid_dage"], 1)} |')
+          lines.append(f'| total supply (bn kr) | {fmt_num(latest["Total_Samlet_Udbud_mia_kr"], 3)} |')
+          lines.append("")
+
+          lines.append("### Changes")
+          lines.append("")
+          lines.append("| metric | latest | Δ 1d | Δ 7d | Δ 14d |")
+          lines.append("|---|---:|---:|---:|---:|")
+
+          lines.append(md_line(
+              "total listings",
+              latest["Total_Antal_Boliger"],
+              prev["Total_Antal_Boliger"] if prev else None,
+              w7["Total_Antal_Boliger"] if w7 else None,
+              w14["Total_Antal_Boliger"] if w14 else None,
+              digits=0
+          ))
+          lines.append(md_line(
+              "avg price (kr)",
+              latest["Total_Gns_Pris_kr"],
+              prev["Total_Gns_Pris_kr"] if prev else None,
+              w7["Total_Gns_Pris_kr"] if w7 else None,
+              w14["Total_Gns_Pris_kr"] if w14 else None,
+              digits=0
+          ))
+          lines.append(md_line(
+              "median price (kr)",
+              latest["Total_Median_Pris_kr"],
+              prev["Total_Median_Pris_kr"] if prev else None,
+              w7["Total_Median_Pris_kr"] if w7 else None,
+              w14["Total_Median_Pris_kr"] if w14 else None,
+              digits=0
+          ))
+          lines.append(md_line(
+              "avg m² price (kr/m²)",
+              latest["Total_Gns_M2_Pris_kr"],
+              prev["Total_Gns_M2_Pris_kr"] if prev else None,
+              w7["Total_Gns_M2_Pris_kr"] if w7 else None,
+              w14["Total_Gns_M2_Pris_kr"] if w14 else None,
+              digits=0
+          ))
+          lines.append(md_line(
+              "avg time on market (days)",
+              latest["Total_Gns_Liggetid_dage"],
+              prev["Total_Gns_Liggetid_dage"] if prev else None,
+              w7["Total_Gns_Liggetid_dage"] if w7 else None,
+              w14["Total_Gns_Liggetid_dage"] if w14 else None,
+              digits=1
+          ))
+          lines.append(md_line(
+              "total supply (bn kr)",
+              latest["Total_Samlet_Udbud_mia_kr"],
+              prev["Total_Samlet_Udbud_mia_kr"] if prev else None,
+              w7["Total_Samlet_Udbud_mia_kr"] if w7 else None,
+              w14["Total_Samlet_Udbud_mia_kr"] if w14 else None,
+              digits=3
+          ))
+          lines.append("")
+
+          lines.append("### Rolling stats (last 7 days)")
+          lines.append("")
+          lines.append("| metric | avg 7d | min 7d | max 7d | std 7d | trend (per day) |")
+          lines.append("|---|---:|---:|---:|---:|---:|")
+
+          def roll_line(name, key, digits, trend_digits):
+              s = stats[key]
+              return (
+                  f"| {name} | {fmt_num(s['avg_7d'], digits)} | {fmt_num(s['min_7d'], digits)} | {fmt_num(s['max_7d'], digits)} | "
+                  f"{fmt_num(s['std_7d'], digits)} | {fmt_num(s['trend_slope_7d'], trend_digits)} |"
+              )
+
+          lines.append(roll_line("total listings", "Total_Antal_Boliger", 0, 1))
+          lines.append(roll_line("avg price (kr)", "Total_Gns_Pris_kr", 0, 0))
+          lines.append(roll_line("median price (kr)", "Total_Median_Pris_kr", 0, 0))
+          lines.append(roll_line("avg m² price (kr/m²)", "Total_Gns_M2_Pris_kr", 0, 0))
+          lines.append(roll_line("avg time on market (days)", "Total_Gns_Liggetid_dage", 1, 2))
+          lines.append(roll_line("total supply (bn kr)", "Total_Samlet_Udbud_mia_kr", 3, 3))
+          lines.append("")
+
+          # skriv både til summary og som report.md artifact
+          report_md = "\n".join(lines) + "\n"
+
+          with open(summary_path, "a", encoding="utf-8") as f:
+              f.write(report_md)
+
+          with open("report.md", "w", encoding="utf-8") as f:
+              f.write(report_md)
+
+          print("report written to job summary + report.md")
+          PY
+
+      - name: upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: supabase-ping-latest
-          path: latest.json
+          name: supabase-ping-report
+          path: |
+            data.json
+            report.md
