@@ -1,0 +1,43 @@
+name: supabase ping + mini report
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # hver 6. time (UTC)
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping supabase + create report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -euo pipefail
+
+          # 1) Ping (lille SELECT). Hvis denne fejler, fejler workflowet også.
+          echo "Pinging Supabase REST..."
+          curl -sS -f \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            "${SUPABASE_URL}/rest/v1/daily_stats?select=Dato,Total_Antal_Boliger,Total_Gns_Pris_kr&order=Dato.desc&limit=1" \
+            -o latest.json
+
+          # 2) Mini-analyse tilbage til GitHub (Actions Job Summary)
+          echo "## Supabase ping report ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- time (utc): $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_STEP_SUMMARY"
+          echo "- supabase url: ${SUPABASE_URL}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### latest row from daily_stats" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat latest.json >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-ping-latest
+          path: latest.json
